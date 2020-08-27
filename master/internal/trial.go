@@ -236,13 +236,6 @@ func newTrial(
 	}
 }
 
-func (t *trial) killTrial(ctx *actor.Context) {
-	t.killed = true
-	if t.task != nil {
-		ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
-	}
-}
-
 func (t *trial) Receive(ctx *actor.Context) error {
 	switch msg := ctx.Message().(type) {
 	case actor.PreStart:
@@ -338,7 +331,12 @@ func (t *trial) Receive(ctx *actor.Context) error {
 
 func (t *trial) runningReceive(ctx *actor.Context) error {
 	switch msg := ctx.Message().(type) {
-	case scheduler.TaskAssigned, scheduler.TerminateRequest, scheduler.TaskAborted, scheduler.TaskTerminated, scheduler.ContainerStarted:
+	case
+		scheduler.TaskAssigned,
+		scheduler.TerminateRequest,
+		scheduler.TaskAborted,
+		scheduler.TaskTerminated,
+		scheduler.ContainerStarted:
 		return t.processScheduler(ctx)
 
 	case containerConnected, sproto.ContainerStateChanged:
@@ -361,16 +359,13 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 			return err
 		}
 
-	case actor.ChildFailed:
-		ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
-
-	case killTrial:
-		t.killTrial(ctx)
+	case actor.ChildFailed, killTrial:
+		t.terminate(ctx, true)
 
 	case terminateTimeout:
-		if t.task != nil && msg.runID == t.runID {
-			ctx.Log().Info("killing unresponsive trial after timeout")
-			ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+		if msg.runID == t.runID {
+			ctx.Log().Info("terminating unresponsive trial is timeout")
+			t.terminate(ctx, true)
 		}
 
 	case actor.ChildStopped:
@@ -384,15 +379,13 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 
 func (t *trial) processScheduler(ctx *actor.Context) error {
 	switch msg := ctx.Message().(type) {
-
 	case scheduler.TaskAssigned:
 		if err := t.processAssigned(ctx, msg); err != nil {
 			return err
 		}
 
 	case scheduler.TerminateRequest:
-		ctx.Log().Info("trial runner requested to terminate")
-		t.pendingGracefulTermination = true
+		t.terminate(ctx, false)
 
 	case scheduler.TaskAborted:
 
@@ -443,7 +436,8 @@ func (t *trial) processAPI(ctx *actor.Context) error {
 		}
 
 	case *apiv1.KillTrialRequest:
-		t.killTrial(ctx)
+		ctx.Log().Info("received API request to kill trial")
+		t.terminate(ctx, true)
 		ctx.Respond(&apiv1.KillTrialResponse{})
 
 	default:
@@ -477,14 +471,14 @@ func (t *trial) processAssigned(ctx *actor.Context, msg scheduler.TaskAssigned) 
 			int64(t.create.TrialSeed))
 		if err := t.db.AddTrial(modelTrial); err != nil {
 			ctx.Log().WithError(err).Error("failed to save trial to database")
-			ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+			t.terminate(ctx, true)
 			return nil
 		}
 		t.processID(ctx, modelTrial.ID)
 		if t.experiment.Config.PerformInitialValidation {
 			if err := t.db.AddNoOpStep(model.NewNoOpStep(t.id, 0)); err != nil {
 				ctx.Log().WithError(err).Error("failed to save zeroth step for initial validation")
-				ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+				t.terminate(ctx, true)
 				return nil
 			}
 		}
@@ -643,9 +637,7 @@ func (t *trial) sendNextWorkload(ctx *actor.Context) error {
 
 	// We have nothing at all to do, so terminate now.
 	default:
-		ctx.Log().Info("terminating trial runner")
 		terminateNow = true
-		t.pendingGracefulTermination = true
 	}
 
 	// Command the trial runner to do the thing we decided on (if this is not a replay).
@@ -660,7 +652,7 @@ func (t *trial) sendNextWorkload(ctx *actor.Context) error {
 			}
 
 			t.terminationSent = true
-			actors.NotifyAfter(ctx, time.Minute, terminateTimeout{runID: t.runID})
+			t.terminate(ctx, false)
 		} else {
 			if err := saveWorkload(t.db, w); err != nil {
 				ctx.Log().WithError(err).Error("failed to save workload to the database")
@@ -867,7 +859,7 @@ func (t *trial) processContainerTerminated(
 	// from ever being able to start), if the leader of the gang has exited out, or if
 	// one of the containers exited with a failure.
 	if c == nil || c.IsLeader() || msg.ContainerStopped.Failure != nil {
-		ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+		t.terminate(ctx, true)
 	}
 }
 
@@ -1014,4 +1006,18 @@ func (t *trial) trialClosing() bool {
 	return t.earlyExit || t.killed || t.restarts > t.experiment.Config.MaxRestarts ||
 		(t.close != nil && t.sequencer.UpToDate()) ||
 		model.StoppingStates[t.experimentState]
+}
+
+func (t *trial) terminate(ctx *actor.Context, kill bool) {
+	if kill || !t.allReady(ctx){
+		ctx.Log().Info("killing trial")
+		t.killed = true
+		if t.task != nil {
+			ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+		}
+	} else {
+		ctx.Log().Info("terminating trial")
+		t.pendingGracefulTermination = true
+		actors.NotifyAfter(ctx, time.Minute, terminateTimeout{runID: t.runID})
+	}
 }
