@@ -1,0 +1,5 @@
+:orphan:
+
+**Bug Fixes**
+
+- Fix a deadlock for Kubernetes resource provider when gracefully terminating a trial.

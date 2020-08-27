@@ -395,10 +395,6 @@ func (t *trial) processScheduler(ctx *actor.Context) error {
 	case scheduler.ContainerStarted:
 		t.containers[msg.Container.ID()] = msg.Container
 
-		if err := t.pushRendezvous(ctx); err != nil {
-			return errors.Wrap(err, "failed to push rendezvous to trial containers")
-		}
-
 	default:
 		return actor.ErrUnexpectedMessage(ctx)
 	}
@@ -687,8 +683,10 @@ func (t *trial) processContainerConnected(ctx *actor.Context, msg containerConne
 	t.sockets[msg.ContainerID] = ref
 	ctx.Respond(ref)
 
-	if err := t.pushRendezvous(ctx); err != nil {
-		return errors.Wrap(err, "failed to push rendezvous to trial containers")
+	if t.allReady(ctx) {
+		if err := t.pushRendezvous(ctx); err != nil {
+			return errors.Wrap(err, "failed to push rendezvous to trial containers")
+		}
 	}
 
 	return nil
@@ -739,10 +737,6 @@ func (t *trial) allReady(ctx *actor.Context) bool {
 // pushRendezvous gathers up the external addresses for the exposed ports and sends them to all the
 // containers in the trial.
 func (t *trial) pushRendezvous(ctx *actor.Context) error {
-	if !t.allReady(ctx) {
-		return nil
-	}
-
 	type CAddress struct {
 		Container scheduler.Container
 		Addresses []scheduler.Address
