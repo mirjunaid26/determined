@@ -270,7 +270,6 @@ func (t *trial) Receive(ctx *actor.Context) error {
 		t.restore(ctx)
 		t.replaying = false
 
-	// Log-related messages.
 	case sproto.ContainerLog:
 		t.processLog(ctx, msg)
 
@@ -339,16 +338,14 @@ func (t *trial) Receive(ctx *actor.Context) error {
 
 func (t *trial) runningReceive(ctx *actor.Context) error {
 	switch msg := ctx.Message().(type) {
-	case *websocket.Conn:
-		a := api.WrapSocket(msg, searcher.CompletedMessage{}, false)
-		if ref, created := ctx.ActorOf("socket", a); created {
-			ctx.Respond(ref)
-		}
+	case scheduler.TaskAssigned, scheduler.TerminateRequest, scheduler.TaskAborted, scheduler.TaskTerminated, scheduler.ContainerStarted:
+		return t.processScheduler(ctx)
 
-	case containerConnected:
-		if err := t.processContainerConnected(ctx, msg); err != nil {
-			return err
-		}
+	case containerConnected, sproto.ContainerStateChanged:
+		return t.processContainer(ctx)
+
+	case *websocket.Conn, *apiv1.KillTrialRequest:
+		return t.processAPI(ctx)
 
 	case searcher.CompletedMessage:
 		if err := t.processCompletedWorkload(ctx, msg); err != nil {
@@ -367,6 +364,27 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 	case actor.ChildFailed:
 		ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
 
+	case killTrial:
+		t.killTrial(ctx)
+
+	case terminateTimeout:
+		if t.task != nil && msg.runID == t.runID {
+			ctx.Log().Info("killing unresponsive trial after timeout")
+			ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+		}
+
+	case actor.ChildStopped:
+
+	default:
+		return actor.ErrUnexpectedMessage(ctx)
+	}
+
+	return nil
+}
+
+func (t *trial) processScheduler(ctx *actor.Context) error {
+	switch msg := ctx.Message().(type) {
+
 	case scheduler.TaskAssigned:
 		if err := t.processAssigned(ctx, msg); err != nil {
 			return err
@@ -375,6 +393,31 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 	case scheduler.TerminateRequest:
 		ctx.Log().Info("trial runner requested to terminate")
 		t.pendingGracefulTermination = true
+
+	case scheduler.TaskAborted:
+
+	case scheduler.TaskTerminated:
+		t.processTaskTerminated(ctx, msg)
+
+	case scheduler.ContainerStarted:
+		t.containers[msg.Container.ID()] = msg.Container
+
+		if err := t.pushRendezvous(ctx); err != nil {
+			return errors.Wrap(err, "failed to push rendezvous to trial containers")
+		}
+
+	default:
+		return actor.ErrUnexpectedMessage(ctx)
+	}
+	return nil
+}
+
+func (t *trial) processContainer(ctx *actor.Context) error {
+	switch msg := ctx.Message().(type) {
+	case containerConnected:
+		if err := t.processContainerConnected(ctx, msg); err != nil {
+			return err
+		}
 
 	case sproto.ContainerStateChanged:
 		if msg.Container.State != container.Assigned {
@@ -385,28 +428,19 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 			t.processContainerTerminated(ctx, msg)
 		}
 
-	case scheduler.TaskAborted:
+	default:
+		return actor.ErrUnexpectedMessage(ctx)
+	}
+	return nil
+}
 
-	case scheduler.TaskTerminated:
-		t.processTaskTerminated(ctx, msg)
-
-	case killTrial:
-		t.killTrial(ctx)
-
-	case terminateTimeout:
-		if t.task != nil && msg.runID == t.runID {
-			ctx.Log().Info("killing unresponsive trial after timeout")
-			ctx.Tell(t.rp, scheduler.TerminateTask{TaskID: t.task.ID, Forcible: true})
+func (t *trial) processAPI(ctx *actor.Context) error {
+	switch msg := ctx.Message().(type) {
+	case *websocket.Conn:
+		a := api.WrapSocket(msg, searcher.CompletedMessage{}, false)
+		if ref, created := ctx.ActorOf("socket", a); created {
+			ctx.Respond(ref)
 		}
-
-	case scheduler.ContainerStarted:
-		t.containers[msg.Container.ID()] = msg.Container
-
-		if err := t.pushRendezvous(ctx); err != nil {
-			return errors.Wrap(err, "failed to push rendezvous to trial containers")
-		}
-
-	case actor.ChildStopped:
 
 	case *apiv1.KillTrialRequest:
 		t.killTrial(ctx)
@@ -415,7 +449,6 @@ func (t *trial) runningReceive(ctx *actor.Context) error {
 	default:
 		return actor.ErrUnexpectedMessage(ctx)
 	}
-
 	return nil
 }
 
